@@ -1,0 +1,101 @@
+import json
+import boto3
+import csv
+import io
+import re
+
+# Initialize AWS clients
+s3_client = boto3.client('s3')
+ssm_client = boto3.client('ssm')
+sns_client = boto3.client('sns')
+
+# Email validation regex pattern
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+
+# Fetch schema validation rules from Parameter Store
+def get_schema_validation_rules():
+    response = ssm_client.get_parameter(Name='/schema-validation-rules/data-lake')
+    return json.loads(response['Parameter']['Value'])
+
+# Fetch SNS Topic ARN dynamically from Parameter Store
+def get_sns_topic_arn():
+    response = ssm_client.get_parameter(Name='/sns-topic-arn/data-validation')
+    return response['Parameter']['Value']
+
+# Send SNS notification on validation failure
+def send_sns_notification(message, sns_topic_arn):
+    sns_client.publish(
+        TopicArn=sns_topic_arn,
+        Message=message,
+        Subject='Data Validation Failed'
+    )
+
+# Validate a record against the schema and perform necessary checks
+def validate_record(record, schema_rules):
+    validation_errors = []
+    
+    for field, field_type in schema_rules.items():
+        if field not in record:
+            validation_errors.append(f"Missing field: {field}")
+        else:
+            value = record[field]
+            
+            # Validate Integer fields
+            if field_type == 'int':
+                if not value.isdigit():
+                    validation_errors.append(f"Field '{field}' should be an integer, but found '{value}'")
+                else:
+                    # Add additional checks for integers (e.g., positive integers)
+                    if int(value) < 0:
+                        validation_errors.append(f"Field '{field}' should be a positive integer, but found '{value}'")
+
+            # Validate String fields
+            elif field_type == 'string':
+                if not isinstance(value, str) or len(value) == 0:
+                    validation_errors.append(f"Field '{field}' should be a non-empty string")
+                    
+            # Validate Email fields
+            elif field_type == 'email':
+                if not EMAIL_REGEX.match(value):
+                    validation_errors.append(f"Field '{field}' should be a valid email, but found '{value}'")
+    
+    return validation_errors
+
+def lambda_handler(event, context):
+    # Get bucket and object info from the event
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    object_key = event['Records'][0]['s3']['object']['key']
+
+    # Fetch the schema validation rules from Parameter Store
+    schema_rules = get_schema_validation_rules()
+
+    # Fetch the SNS Topic ARN from Parameter Store
+    sns_topic_arn = get_sns_topic_arn()
+
+    # Download the file from S3
+    s3_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    file_content = s3_object['Body'].read().decode('utf-8')
+
+    # Parse the file 
+    csv_reader = csv.DictReader(io.StringIO(file_content))
+    failed_records = []
+
+    for row in csv_reader:
+        errors = validate_record(row, schema_rules)
+        if errors:
+            failed_records.append({"row": row, "errors": errors})
+
+    # If any records failed validation, send an SNS notification
+    if failed_records:
+        message = f"Validation failed for {len(failed_records)} records:\n{json.dumps(failed_records, indent=2)}"
+        send_sns_notification(message, sns_topic_arn)
+
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': 'Validation failed', 'failed_records': failed_records})
+        }
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'message': 'Validation successful'})
+    }
