@@ -1,0 +1,5 @@
+{
+  "bucket_name": "customer-orders-010928188065-useast1",
+  "Database": "customer_orders_db",
+  "sql": "SELECT * FROM sales_transactions WHERE (transaction_amount < 0 OR transaction_amount > 10000) or ( NOT REGEXP_LIKE (transaction_date, '^\\d{4}-\\d{2}-\\d{2}$'))"
+}
