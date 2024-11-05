@@ -1,0 +1,164 @@
+import boto3
+import boto3
+import pandas as pd
+import os, io
+from sqlalchemy import create_engine
+import json
+
+# Boto3 clients
+s3_client = boto3.client('s3')
+sns_client = boto3.client('sns')
+secrets_client = boto3.client('secretsmanager')
+ssm_client = boto3.client('ssm')
+
+def get_account_id():
+    """
+    Retrieve the AWS Account ID dynamically using STS.
+    """
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()['Account']
+    return account_id
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler function triggered by S3 event.
+    Reads CSV data from S3, validates it based on rules (including a threshold limit), 
+    and loads it into RDS using df.to_sql. Sends SNS alerts if anomalies are found.
+
+    Args:
+        event (dict): Event data from S3 trigger.
+        context (LambdaContext): Runtime information for the function.
+    Returns:
+        dict: Response containing the status of the operation.
+    """
+    try:
+        print(f"Received event: {json.dumps(event)}")
+        
+        # 1. Extract S3 bucket and object key from event
+        bucket_name = event['Records'][0]['s3']['bucket']['name']
+        object_key = event['Records'][0]['s3']['object']['key']
+        print(f"Processing file from bucket: {bucket_name}, key: {object_key}")
+        
+        # 2. Get environment-specific parameters
+        table_name = get_parameter('/ecommerce/dev/table_name')
+        threshold_limit = float(get_parameter('/ecommerce/dev/threshold_limit'))  # Threshold for transaction amounts
+        print(f"Threshold limit: {threshold_limit}, Table name: {table_name}")
+        
+        # 3. Retrieve RDS credentials from Secrets Manager
+        db_credentials = get_secret('ecommerce-salestrxn-credentials')
+        print("RDS credentials retrieved successfully")
+        
+        # 4. Download and process the CSV file from S3
+        file_content = s3_client.get_object(Bucket=bucket_name, Key=object_key)['Body'].read().decode('utf-8')
+        df = pd.read_csv(io.StringIO(file_content))
+        print(f"CSV file loaded successfully with {len(df)} records")
+        
+        # 5. Data validation based on the threshold and other checks
+        if not validate_data(df, threshold_limit):
+            send_sns_alert(f"Anomalies found in {object_key} exceeding threshold of {threshold_limit}", 'transaction-alerts')
+            print(f"Anomalies found in file: {object_key}")
+        else:
+            print(f"Data in {object_key} passed validation")
+        
+        
+        #engine = connect_to_rds(db_user, db_password, db_host, db_name)
+        
+        #if engine:
+        # 6. Connect to RDS using SQLAlchemy and load data using df.to_sql()
+        if not load_data_to_rds(df, db_credentials, table_name, if_exists_option='replace'):
+            print(f"Failed to load data from {object_key} into RDS")
+            return {
+                'statusCode': 500,
+                'body': 'Failed to connect to RDS'
+            }
+        else:
+            print(f"Data from {object_key} loaded into RDS successfully")
+            
+        
+        # 7. Move processed file to "processed/" folder
+        move_processed_file(bucket_name, object_key)
+        print(f"File {object_key} moved to 'processed/' folder")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Data processing and loading completed successfully.')
+        }
+    
+    except Exception as e:
+        error_message = f"Error during Lambda execution: {str(e)}"
+        print(error_message)
+        send_sns_alert(error_message, 'transaction-alerts')
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error during execution: {str(e)}")
+        }
+
+def get_secret(secret_name):
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    print(f"Secret {secret_name} retrieved successfully")
+    return json.loads(response['SecretString'])
+
+def get_parameter(param_name):
+    response = ssm_client.get_parameter(Name=param_name)
+    print(f"Parameter {param_name} retrieved successfully")
+    return response['Parameter']['Value']
+
+def validate_data(df, threshold_limit):
+    invalid_data = df[df['transaction_amount'] < 0]
+    exceeding_threshold = df[df['transaction_amount'] > threshold_limit]
+    invalid_emails = df[~df['email'].str.contains(r'^[\w\.-]+@[\w\.-]+$', regex=True)]
+    invalid_strings = df[df['customer_name'].apply(lambda x: not isinstance(x, str))]
+
+    if not invalid_data.empty or not exceeding_threshold.empty or not invalid_emails.empty or not invalid_strings.empty:
+        print(f"Validation failed. Invalid data count: {len(invalid_data)}, Exceeding threshold: {len(exceeding_threshold)}")
+        return False
+    return True
+
+def send_sns_alert(message, topic_arn):
+    print(f"Sending SNS alert: {message}")
+    sns_client.publish(
+        TopicArn=f'arn:aws:sns:{get_region()}:{get_account_id()}:{topic_arn}',
+        Message=message
+    )
+
+def move_processed_file(bucket_name, object_key):
+    new_key = object_key.replace('incoming/', 'processed/')
+    s3_client.copy_object(Bucket=bucket_name, CopySource={'Bucket': bucket_name, 'Key': object_key}, Key=new_key)
+    s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+    print(f"Moved {object_key} to {new_key}")
+    
+def get_region():
+    """
+    Retrieve the AWS region where the Lambda is running.
+
+    Returns:
+        str: The AWS region.
+    """
+    return os.environ['AWS_REGION']
+
+def connect_to_rds(db_user, db_password, db_host, db_name):
+    try:
+        
+        print("Connected to RDS successfully")
+        return engine
+    except Exception as e:
+        error_message = f"Error connecting to RDS: {str(e)}"
+        print(error_message)
+        send_sns_alert(error_message, 'transaction-alerts')
+        return False
+
+def load_data_to_rds(df, db_credentials, table_name, if_exists_option='replace'):
+    try:
+        db_host = db_credentials['host']
+        db_user = db_credentials['username']
+        db_password = db_credentials['password']
+        db_name = db_credentials['dbname']
+        engine = create_engine(f'mysql+pymysql://{db_user}:{db_password}@{db_host}/{db_name}')
+        df.to_sql(table_name, engine, if_exists=if_exists_option, index=False)
+        print(f"Data loaded to RDS table '{table_name}' successfully")
+        return True
+    except Exception as e:
+        error_message = f"Error loading data to RDS: {str(e)}"
+        print(error_message)
+        send_sns_alert(error_message, 'transaction-alerts')
+        return False
