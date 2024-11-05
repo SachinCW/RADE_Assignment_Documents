@@ -1,0 +1,38 @@
+import boto3
+
+athena = boto3.client('athena')
+
+def lambda_handler(event, context):
+    # Extract bucket name and folder from event
+    batch_date = event['batch_date']
+    database = 'your_athena_database'
+    output_location = 's3://customer-orders-010928188065-useast1/athena-results/'
+    
+    query = f"""
+        SELECT * 
+        FROM your_table
+        WHERE batch_date = '{batch_date}'
+        LIMIT 10;
+    """
+    
+    try:
+        response = athena.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={
+                'Database': database
+            },
+            ResultConfiguration={
+                'OutputLocation': output_location,
+            }
+        )
+        print(f"Athena query is successful {response['QueryExecutionId']}")
+        return {
+            'statusCode': 200,
+            'QueryExecutionId': response['QueryExecutionId']
+        }
+    except Exception as e:
+        print(f"Athena query is Failed {str(e)}")
+        return {
+            'statusCode': 500,
+            'error': str(e)
+        }
