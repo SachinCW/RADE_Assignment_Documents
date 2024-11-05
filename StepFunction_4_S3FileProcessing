@@ -1,0 +1,29 @@
+{
+  "Comment": "Athena Query and Notification Workflow",
+  "StartAt": "Start Query",
+  "States": {
+    "Start Query": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "select * FROM customer_orders WHERE date_parse(order_date, '%m/%d/%Y') >= date_add('day', -30, current_date)",
+        "QueryExecutionContext": {
+          "Database": "customer_orders_db"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://customer-orders-010928188065-useast1/athena-results/"
+        }
+      },
+      "Next": "Send Notification"
+    },
+    "Send Notification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message": "Athena query completed successfully.",
+        "TopicArn": "arn:aws:sns:us-east-1:010928188065:dehtopic"
+      },
+      "End": true
+    }
+  }
+}
