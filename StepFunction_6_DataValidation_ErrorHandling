@@ -1,0 +1,33 @@
+import boto3
+import csv
+import json
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    # Retrieve invalid records from the Athena results
+    
+    bucket_name = event['bucket_name']
+    invalid_folder = event['invalid_folder'] 
+    # Define the source and destination 
+    result_folder = 'result-folder/' 
+    invalid_folder = f"{invalid_folder}/" 
+    # List the objects in the result folder 
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=result_folder) 
+    records_moved = False 
+    
+    if 'Contents' in response: 
+        for obj in response['Contents']: 
+            copy_source = {'Bucket': bucket_name, 'Key': obj['Key']} 
+            destination_key = obj['Key'].replace(result_folder, invalid_folder) 
+            
+    # Move the object to the invalid folder 
+    s3.copy_object(CopySource=copy_source, Bucket=bucket_name, Key=destination_key) 
+    s3.delete_object(Bucket=bucket_name, Key=obj['Key']) 
+    records_moved = True 
+    return { 
+        'statusCode': 200, 
+        'body': json.dumps('Records moved to invalid folder'), 
+        'records_moved': records_moved 
+        
+    }
