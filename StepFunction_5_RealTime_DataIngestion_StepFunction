@@ -1,0 +1,48 @@
+{
+  "Comment": "S3 File Processing Pipeline",
+  "StartAt": "MoveFileBasedOnBatchDate",
+  "States": {
+    "MoveFileBasedOnBatchDate": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:010928188065:function:MoveFileLambda",
+      "Parameters": {
+        "Records.$": "$.Records"
+      },
+      "Next": "TriggerAthenaQuery",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MoveFileFailed"
+        }
+      ]
+    },
+    "TriggerAthenaQuery": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:010928188065:function:AthenaQueryLambda",
+      "Parameters": {
+        "batch_date.$": "$.batch_date"
+      },
+      "End": true,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "AthenaQueryFailed"
+        }
+      ]
+    },
+    "MoveFileFailed": {
+      "Type": "Fail",
+      "Error": "MoveFileFailed",
+      "Cause": "Lambda function failed to move file"
+    },
+    "AthenaQueryFailed": {
+      "Type": "Fail",
+      "Error": "AthenaQueryFailed",
+      "Cause": "Athena query failed"
+    }
+  }
+}
