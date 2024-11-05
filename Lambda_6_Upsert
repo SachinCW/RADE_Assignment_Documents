@@ -1,0 +1,295 @@
+import boto3
+import pandas as pd
+import os, io
+from sqlalchemy import create_engine
+import json
+import re
+import datetime
+import csv
+import pymysql
+
+# Boto3 clients
+s3_client = boto3.client('s3')
+sns_client = boto3.client('sns')
+secrets_client = boto3.client('secretsmanager')
+ssm_client = boto3.client('ssm')
+
+# Email validation regex pattern
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+
+def get_account_id():
+    """
+    Retrieve the AWS Account ID dynamically using STS.
+    """
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()['Account']
+    return account_id
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler function triggered by S3 event.
+    Reads CSV data from S3, validates it based on rules (including a threshold limit), 
+    and loads it into RDS using df.to_sql. Sends SNS alerts if anomalies are found.
+
+    Args:
+        event (dict): Event data from S3 trigger.
+        context (LambdaContext): Runtime information for the function.
+    Returns:
+        dict: Response containing the status of the operation.
+    """
+    try:
+        print(f"Received event: {json.dumps(event)}")
+        
+        # 1. Extract S3 bucket and object key from event
+        bucket_name = event['Records'][0]['s3']['bucket']['name']
+        object_key = event['Records'][0]['s3']['object']['key']
+        print(f"Processing file from bucket: {bucket_name}, key: {object_key}")
+        
+        # 2. Get environment-specific parameters
+        stg_table_name = get_parameter('/ecommerce/dev/table_name')
+        final_table_name = get_parameter('/ecommerce/dev/final_table_name')
+        summary_table_name = get_parameter('/ecommerce/dev/summary_table_name')
+        threshold_limit = float(get_parameter('/ecommerce/dev/threshold_limit'))  # Threshold for transaction amounts
+        # Fetch the schema validation rules from Parameter Store
+        schema_rules = get_schema_validation_rules()
+        print(f"Threshold limit: {threshold_limit}, Stage Table name: {stg_table_name}, Final Table name {final_table_name}, Summary Table Name: {summary_table_name}")
+        
+        # 3. Retrieve RDS credentials from Secrets Manager
+        db_credentials = get_secret('ecommerce-salestrxn-credentials')
+        print("RDS credentials retrieved successfully")
+        
+        # 4. Download and process the CSV file from S3
+        file_content = s3_client.get_object(Bucket=bucket_name, Key=object_key)['Body'].read().decode('utf-8')
+        # Parse the file 
+        csv_reader = csv.DictReader(io.StringIO(file_content))
+        failed_records = []
+        
+        # Fetch DB credentials from AWS Secret Manager
+        db_credentials = get_db_credentials()
+        
+        # 5. Establish a database connection using the credentials
+        conn = pymysql.connect(
+            db=db_credentials['dbname'],
+            user=db_credentials['user'],
+            password=db_credentials['password'],
+            host=db_credentials['host'],
+            port=int(db_credentials['port'])
+        )
+        cursor = conn.cursor()
+        
+        # 6. Truncate the staging table
+        truncate_table_if_exists(cursor, stg_table_name)
+        print("Truncate the stage table")
+        
+        for row in csv_reader:
+            errors = validate_record(row, schema_rules)
+            if errors:
+                failed_records.append({"row": row, "errors": errors})
+                print("Failed records are found")
+            else:
+                # Insert valid rows into the staging table
+                query = f'''
+                            INSERT INTO {stg_table_name} (transaction_id, customer_id, customer_name, order_date, 
+                                                          product_id, product_name, quantity, transaction_amount, 
+                                                          total_price, email, phone_number)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        '''
+                cursor.execute(query, (
+                        row['transaction_id'], row['customer_id'], row['customer_name'], row['order_date'], 
+                        row['product_id'], row['product_name'], row['quantity'], row['transaction_amount'], 
+                        row['total_price'], row['email'], row['phone_number']
+                ))
+                print("Inserted valid rows into the staging table")
+        
+        # If any records failed validation, send an SNS notification
+        if failed_records:
+            message = f"Validation failed for {len(failed_records)} records:\n{json.dumps(failed_records, indent=2)}"
+            send_sns_notification(message, sns_topic_arn)
+            print("Validation is failed. sns notification is processed")
+        
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'message': 'Validation failed', 'failed_records': failed_records})
+            }
+        
+        # Get the current date for the loaded_date column
+        loaded_date = datetime.datetime.utcnow()
+        
+        # 7. Upsert the data from the staging table to the sales_transaction table
+        upsert_to_sales_transaction(cursor, final_table_name, stg_table_name, loaded_date)
+        print("Final table is upserted")
+        
+        # 8. Load summary data into the sales_summary table
+        load_sales_summary(cursor, summary_table_name, final_table_name, loaded_date)
+        print("Summary table is loaded")
+        
+        # 9. Move processed file to "processed/" folder
+        move_processed_file(bucket_name, object_key)
+        print(f"File {object_key} moved to 'processed/' folder")
+        
+        
+        
+        # Commit the transaction
+        conn.commit()
+        
+        # Close the database connection
+        cursor.close()
+        conn.close()
+
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Data processing and loading completed successfully.')
+        }
+    
+    except Exception as e:
+        error_message = f"Error during Lambda execution: {str(e)}"
+        print(error_message)
+        send_sns_alert(error_message, 'transaction-alerts')
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error during execution: {str(e)}")
+        }
+
+# Helper functions as before, with added print logging
+def get_secret(secret_name):
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    print(f"Secret {secret_name} retrieved successfully")
+    return json.loads(response['SecretString'])
+
+def get_parameter(param_name):
+    response = ssm_client.get_parameter(Name=param_name)
+    print(f"Parameter {param_name} retrieved successfully")
+    return response['Parameter']['Value']
+
+def truncate_table_if_exists(cursor, stg_table_name):
+    query = f"TRUNCATE TABLE {stg_table_name}"
+    cursor.execute(query)
+        
+def get_schema_validation_rules():
+    response = ssm_client.get_parameter(Name='/schema-validation-rules/data-lake')
+    return json.loads(response['Parameter']['Value'])
+
+# Validate a record against the schema and perform necessary checks
+def validate_record(record, schema_rules):
+    validation_errors = []
+    
+    for field, field_type in schema_rules.items():
+        if field not in record:
+            validation_errors.append(f"Missing field: {field}")
+        else:
+            value = record[field]
+            
+            # Validate Integer fields
+            if field_type == 'int':
+                if not value.isdigit():
+                    validation_errors.append(f"Field '{field}' should be an integer, but found '{value}'")
+                else:
+                    # Add additional checks for integers (e.g., positive integers)
+                    if int(value) < 0:
+                        validation_errors.append(f"Field '{field}' should be a positive integer, but found '{value}'")
+
+            # Validate String fields
+            elif field_type == 'string':
+                if not isinstance(value, str) or len(value) == 0:
+                    validation_errors.append(f"Field '{field}' should be a non-empty string")
+                    
+            # Validate Email fields
+            elif field_type == 'email':
+                if not EMAIL_REGEX.match(value):
+                    validation_errors.append(f"Field '{field}' should be a valid email, but found '{value}'")
+    
+    return validation_errors
+def send_sns_alert(message, topic_arn):
+    print(f"Sending SNS alert: {message}")
+    sns_client.publish(
+        TopicArn=f'arn:aws:sns:{get_region()}:{get_account_id()}:{topic_arn}',
+        Message=message
+    )
+
+def move_processed_file(bucket_name, object_key):
+    new_key = object_key.replace('incoming/', 'processed/')
+    s3_client.copy_object(Bucket=bucket_name, CopySource={'Bucket': bucket_name, 'Key': object_key}, Key=new_key)
+    s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+    print(f"Moved {object_key} to {new_key}")
+    
+def get_region():
+    """
+    Retrieve the AWS region where the Lambda is running.
+
+    Returns:
+        str: The AWS region.
+    """
+    return os.environ['AWS_REGION']
+
+
+def load_data_to_rds(df, db_credentials, table_name, if_exists_option='replace'):
+    try:
+        db_host = db_credentials['host']
+        db_user = db_credentials['username']
+        db_password = db_credentials['password']
+        db_name = db_credentials['dbname']
+        engine = create_engine(f'mysql+pymysql://{db_user}:{db_password}@{db_host}/{db_name}')
+        df.to_sql(table_name, engine, if_exists=if_exists_option, index=False)
+        print(f"Data loaded to RDS table '{table_name}' successfully")
+        return True
+    except Exception as e:
+        error_message = f"Error loading data to RDS: {str(e)}"
+        print(error_message)
+        send_sns_alert(error_message, 'transaction-alerts')
+        return False
+        
+
+# Upsert from staging table to sales_transaction table
+def upsert_to_sales_transaction(cursor, final_table_name, stg_table_name, loaded_date):
+    
+    query = f'''
+    INSERT INTO {final_table_name} (transaction_id, customer_id, customer_name, order_date, 
+                                    product_id, product_name, quantity, transaction_amount, total_price, 
+                                    email, phone_number, loaded_date)
+    SELECT transaction_id, customer_id, customer_name, order_date, 
+           product_id, product_name, quantity, transaction_amount, total_price, 
+           email, phone_number, %s 
+    FROM {stg_table_name}
+    ON DUPLICATE KEY UPDATE 
+        customer_id = VALUES(customer_id),
+        customer_name = VALUES(customer_name),
+        order_date = VALUES(order_date),
+        product_id = VALUES(product_id),
+        product_name = VALUES(product_name),
+        quantity = VALUES(quantity),
+        transaction_amount = VALUES(transaction_amount),
+        total_price = VALUES(total_price),
+        email = VALUES(email),
+        phone_number = VALUES(phone_number),
+        loaded_date = VALUES(loaded_date);
+        '''
+
+    # Execute the query with the loaded_date value as a parameter
+    cursor.execute(query, (loaded_date,))
+
+
+# Load summary data to sales_summary table
+def load_sales_summary(cursor, summary_table_name, final_table_name, loaded_date):
+    truncate_query = f'TRUNCATE TABLE {summary_table_name};'
+    cursor.execute(truncate_query)
+    
+    query = f'''
+    INSERT INTO {summary_table_name} (customer_id, loaded_date, total_spent, total_transactions)
+    SELECT customer_id, %s, SUM(total_price), COUNT(transaction_id)
+    FROM {final_table_name}
+    GROUP BY customer_id;
+    '''
+    cursor.execute(query, (loaded_date,))
+    
+def get_db_credentials():
+    secret_name = "ecommerce-salestrxn-credentials"
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    secret = json.loads(response['SecretString'])
+    return {
+        'dbname': secret['dbname'],
+        'user': secret['username'],
+        'password': secret['password'],
+        'host': secret['host'],
+        'port': secret['port']
+    }
