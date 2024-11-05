@@ -1,0 +1,61 @@
+import boto3
+import csv
+from io import StringIO
+import os
+
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    # Get the S3 bucket and object details from the event
+    records = event['Records']
+    
+    bucket_name = records[0]['s3']['bucket']['name']
+    object_key = records[0]['s3']['object']['key']
+    
+    print(f'bucket name is {bucket_name} and object_key is {object_key}')
+    
+    try:
+        # Get the file from S3
+        csv_file = s3.get_object(Bucket=bucket_name, Key=object_key)
+        content = csv_file['Body'].read().decode('utf-8')
+        
+        
+        # Read CSV and extract the batch_date
+        csv_reader = csv.DictReader(StringIO(content))
+        first_row = next(csv_reader)  # Assume batch_date is in the first row
+        
+        
+        
+        # Extract the batch_date, assume it's in the format 'YYYY-MM-DD'
+        batch_date = first_row['batch_date']
+        
+        year, month, day = batch_date.split('-')
+        print(f'batch_date is read {batch_date}')
+        
+        # Define the new folder structure
+        new_folder = f'orders/batch_date/year={year}/month={month}/day={day}/'
+        
+        # Define the new file path in the new folder
+        new_file_key = new_folder + os.path.basename(object_key)
+        print(f"new file location: {new_file_key}")
+        
+        # Copy the file to the new folder location
+        copy_source = {'Bucket': bucket_name, 'Key': object_key}
+        s3.copy_object(Bucket=bucket_name, CopySource=copy_source, Key=new_file_key)
+        print('File is copied to new location')
+        
+        # Optionally, delete the original file after copying
+        s3.delete_object(Bucket=bucket_name, Key=object_key)
+        print('File is deleted from original location')
+        
+        return {
+            'statusCode': 200,
+            'message': f'File moved to {new_file_key}',
+            'batch_date': batch_date
+        }
+    except Exception as e:
+        print(f'Error: {e}')
+        return {
+            'statusCode': 500,
+            'error': str(e)
+        }
