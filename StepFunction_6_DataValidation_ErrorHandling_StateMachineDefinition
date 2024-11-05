@@ -1,0 +1,82 @@
+{ 
+  "Comment": "Athena Validation and Data Movement Step Function", 
+  "StartAt": "Run Athena Query", 
+  "States": { 
+    "Run Athena Query": 
+    { 
+      "Type": "Task", 
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync", 
+      "Parameters": { 
+        "QueryString.$": "$.sql", 
+        "QueryExecutionContext": { 
+          "Database.$": "$.Database" 
+        }, 
+        "ResultConfiguration": { 
+          "OutputLocation.$": "States.Format('s3://{}/result-folder/', $.bucket_name)" } 
+        }, 
+        "ResultPath": "$.athenaResult",
+        "Catch": [ 
+          { 
+            "ErrorEquals": ["States.ALL"], 
+            "Next": "Send Athena Query Failure SNS" 
+          } 
+        ], 
+        "Next": "Invoke Lambda for Moving Invalid Records" 
+    }, 
+    "Invoke Lambda for Moving Invalid Records": { 
+      "Type": "Task", 
+      "Resource": "arn:aws:lambda:us-east-1:010928188065:function:MoveInvalidRecords", 
+      "Parameters": { 
+        "bucket_name.$": "$.bucket_name", 
+        "invalid_folder": "invalid" 
+      }, 
+      "Catch": [ 
+        { 
+          "ErrorEquals": ["States.ALL"], 
+          "Next": "Send Lambda Failure SNS" 
+        } 
+      ], "Next": "Check if Records Moved" 
+    }, 
+    "Check if Records Moved": { 
+      "Type": "Choice", 
+      "Choices": [ 
+        { 
+          "Variable": "$.records_moved", 
+          "BooleanEquals": true, 
+          "Next": "Send Records Moved SNS" 
+        }
+      ], 
+      "Default": "End State" 
+    }, 
+    "Send Records Moved SNS": { 
+      "Type": "Task", 
+      "Resource": "arn:aws:states:::sns:publish", 
+      "Parameters": { 
+        "Message": "Records were moved to the invalid folder", 
+        "TopicArn": "arn:aws:sns:us-east-1:010928188065:dehtopic" 
+      }, 
+      "Next": "End State" 
+    }, 
+    "Send Athena Query Failure SNS": { 
+      "Type": "Task", 
+      "Resource": "arn:aws:states:::sns:publish", 
+      "Parameters": { 
+        "Message": "Athena query failed!", 
+        "TopicArn": "arn:aws:sns:us-east-1:010928188065:dehtopic" 
+      }, 
+      "Next": "End State" 
+    }, 
+    "Send Lambda Failure SNS": { 
+      "Type": "Task", 
+      "Resource": "arn:aws:states:::sns:publish", 
+      "Parameters": { 
+        "Message": "Lambda function failed!", 
+        "TopicArn": "arn:aws:sns:us-east-1:010928188065:dehtopic" 
+      }, 
+      "Next": "End State" 
+    }, 
+    "End State": { 
+      "Type": "Succeed" 
+    }
+  } 
+}
