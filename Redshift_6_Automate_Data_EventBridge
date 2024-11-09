@@ -1,0 +1,101 @@
+{
+  "Comment": "A state machine to grant permissions and execute SQL statements in Redshift Serverless",
+  "StartAt": "ExecuteFirstStatement",
+  "States": {
+    "ExecuteFirstStatement": {
+      "Type": "Task",
+      "Parameters": {
+        "Database": "dev",
+        "WorkgroupName": "deh",
+        "Sql": "COPY Transactions FROM 's3://customer-orders-010928188065-useast1/raw-data/transactions.csv' IAM_ROLE 'arn:aws:iam::010928188065:role/service-role/AmazonRedshift-CommandsAccessRole-20241031T155528' delimiter ',' DATEFORMAT 'YYYY-MM-DD' IGNOREHEADER 1;"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Next": "WaitForFirstStatement",
+      "ResultPath": "$.firstStatementResult"
+    },
+    "WaitForFirstStatement": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "CheckFirstStatementStatus"
+    },
+    "CheckFirstStatementStatus": {
+      "Type": "Task",
+      "Parameters": {
+        "Id.$": "$.firstStatementResult.Id"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "ResultPath": "$.firstStatementStatus",
+      "Next": "CheckIfFirstStatementComplete"
+    },
+    "CheckIfFirstStatementComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.firstStatementStatus.Status",
+          "StringEquals": "FINISHED",
+          "Next": "ExecuteSecondStatement"
+        },
+        {
+          "Variable": "$.firstStatementStatus.Status",
+          "StringEquals": "FAILED",
+          "Next": "FailFirstStatement"
+        }
+      ],
+      "Default": "WaitForFirstStatement"
+    },
+    "FailFirstStatement": {
+      "Type": "Fail",
+      "Error": "RedshiftDataError",
+      "Cause": "The COPY command failed."
+    },
+    "ExecuteSecondStatement": {
+      "Type": "Task",
+      "Parameters": {
+        "Database": "dev",
+        "WorkgroupName": "deh",
+        "Sql": "UNLOAD ('SELECT * FROM Transactions') TO 's3://customer-orders-010928188065-useast1/processed_data/' IAM_ROLE 'arn:aws:iam::010928188065:role/service-role/AmazonRedshift-CommandsAccessRole-20241031T155528' ALLOWOVERWRITE PARALLEL OFF FORMAT AS PARQUET;"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Next": "WaitForSecondStatement",
+      "ResultPath": "$.secondStatementResult"
+    },
+    "WaitForSecondStatement": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "CheckSecondStatementStatus"
+    },
+    "CheckSecondStatementStatus": {
+      "Type": "Task",
+      "Parameters": {
+        "Id.$": "$.secondStatementResult.Id"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "ResultPath": "$.secondStatementStatus",
+      "Next": "CheckIfSecondStatementComplete"
+    },
+    "CheckIfSecondStatementComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.secondStatementStatus.Status",
+          "StringEquals": "FINISHED",
+          "Next": "Success"
+        },
+        {
+          "Variable": "$.secondStatementStatus.Status",
+          "StringEquals": "FAILED",
+          "Next": "FailSecondStatement"
+        }
+      ],
+      "Default": "WaitForSecondStatement"
+    },
+    "FailSecondStatement": {
+      "Type": "Fail",
+      "Error": "RedshiftDataError",
+      "Cause": "The UNLOAD command failed."
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}
