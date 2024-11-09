@@ -1,0 +1,104 @@
+import json
+import boto3
+from datetime import datetime, timedelta
+
+# Initialize AWS clients
+s3_client = boto3.client('s3')
+sns_client = boto3.client('sns')
+sqs_client = boto3.client('sqs')
+
+# Thresholds for rule checks
+LARGE_TRANSACTION_THRESHOLD = 10000
+REPEATED_TRANSACTION_THRESHOLD = 5000
+REPEATED_TRANSACTION_COUNT = 3
+TIME_WINDOW_MINUTES = 10
+
+# Resource identifiers
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:010928188065:aml-alerts-topic"
+SQS_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/010928188065/aml-compliance-queue"
+FLAGGED_BUCKET = "customer-orders-010928188065-useast1"
+
+def lambda_handler(event, context):
+    print(event.get("source"))
+    # Get bucket and object key from event
+    #if event.get("source") == "aws.s3":
+    bucket_name = event['detail']['bucket']['name']
+    object_key = event['detail']['object']['key']
+    
+    print(bucket_name,object_key )
+    # else:
+    #     bucket_name = event['Records'][0]['s3']['bucket']['name']
+    #     object_key = event['Records'][0]['s3']['object']['key']
+    
+    # Read file content from S3
+    file_content = s3_client.get_object(Bucket=bucket_name, Key=object_key)['Body'].read().decode('utf-8')
+    transactions = json.loads(file_content)
+    
+    # Dictionary to keep track of recent transactions by account
+    recent_transactions = {}
+
+    for transaction in transactions:
+        account_id = transaction['account_id']
+        amount = transaction['amount']
+        timestamp_upd = transaction['timestamp'].replace('Z', '') 
+        timestamp = datetime.fromisoformat(timestamp_upd)
+        txn_id = transaction['transaction_id']
+
+        # Apply AML rules
+        suspicious = False
+        alert_message = ""
+
+        # Rule 1: Large transaction rule
+        if amount > LARGE_TRANSACTION_THRESHOLD:
+            suspicious = True
+            alert_message = f"Transaction ID {txn_id}: Large transaction detected (${amount})."
+
+        # Rule 2: Repeated transactions rule
+        if account_id in recent_transactions:
+            recent_txns = recent_transactions[account_id]
+            recent_txns = [t for t in recent_txns if t['timestamp'] > timestamp - timedelta(minutes=TIME_WINDOW_MINUTES)]
+            recent_txns.append({'amount': amount, 'timestamp': timestamp})
+            recent_transactions[account_id] = recent_txns
+
+            large_txns_count = sum(1 for t in recent_txns if t['amount'] > REPEATED_TRANSACTION_THRESHOLD)
+            if large_txns_count >= REPEATED_TRANSACTION_COUNT:
+                suspicious = True
+                alert_message = f"Transaction ID {txn_id}: Unusual repeated transactions detected for account {account_id}."
+        else:
+            recent_transactions[account_id] = [{'amount': amount, 'timestamp': timestamp}]
+
+        # If suspicious, trigger alert
+        if suspicious:
+            # Store flagged transaction in flagged bucket
+            flagged_key = f"flagged_transactions/{txn_id}.json"
+            s3_client.put_object(Bucket=FLAGGED_BUCKET, Key=flagged_key, Body=json.dumps(transaction))
+
+            # Send SNS alert
+            print('Calling sns')
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=alert_message,
+                Subject="AML Alert: Suspicious Transaction Detected"
+            )
+
+            # Send SQS message for compliance review
+            
+            try:
+                print('Calling sqs')
+                response = sqs_client.send_message(
+                    QueueUrl=SQS_QUEUE_URL,
+                    MessageBody=json.dumps({
+                        "transaction_id": txn_id,
+                        "account_id": account_id,
+                        "amount": amount,
+                        "alert_message": alert_message
+                    })
+                )
+                print(f"SQS Message ID: {response['MessageId']}")
+            except Exception as e:
+                print("Failed to send message to SQS",str(e))
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Processing complete')
+    }
