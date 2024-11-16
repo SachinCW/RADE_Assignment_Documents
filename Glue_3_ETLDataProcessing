@@ -1,0 +1,52 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import monotonically_increasing_id, avg, col
+from pyspark.sql.types import FloatType
+
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# S3 paths
+input_path = "s3://customer-orders-010928188065-useast1/input/iris.csv"
+filtered_output_path = "s3://customer-orders-010928188065-useast1/filtered_data/"
+aggregated_output_path = "s3://customer-orders-010928188065-useast1/aggregated_data/"
+
+# Load the CSV data from S3
+data = spark.read.csv(input_path, header=True, inferSchema=True)
+
+# Add a unique row_id column
+data_with_id = data.withColumn("row_id", monotonically_increasing_id())
+
+# Replace missing values with column mean (for numeric columns)
+numeric_cols = [field.name for field in data.schema.fields if isinstance(field.dataType, FloatType)]
+
+for col_name in numeric_cols:
+    mean_value = data_with_id.select(avg(col(col_name))).collect()[0][0]
+    data_with_id = data_with_id.fillna({col_name: mean_value})
+
+# Filter rows where sepal_length > 5
+filtered_data = data_with_id.filter(col("sepal_length") > 5)
+
+# Aggregate: Find average petal_length grouped by species
+aggregated_data = filtered_data.groupBy("species").agg(avg("petal_length").alias("avg_petal_length"))
+
+# Write filtered data to S3 in Parquet format
+filtered_data.write.mode("overwrite").parquet(filtered_output_path)
+
+# Write aggregated data to S3 in Parquet format
+aggregated_data.write.mode("overwrite").parquet(aggregated_output_path)
+filtered_data.show(5,False)
+
+aggregated_data.show(5,False)
+
+job.commit()
